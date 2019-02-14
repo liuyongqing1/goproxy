@@ -8,7 +8,9 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime/pprof"
 	"strings"
+	"sync"
 
 	"github.com/snail007/goproxy/core/lib/kcpcfg"
 	encryptconn "github.com/snail007/goproxy/core/lib/transport/encrypt"
@@ -31,6 +33,10 @@ var SDK_VERSION = "No Version Provided"
 
 var (
 	app *kingpin.Application
+	cpuProfilingFile, memProfilingFile, blockProfilingFile,
+	goroutineProfilingFile, threadcreateProfilingFile *os.File
+	isProfiling   bool
+	profilingLock = &sync.Mutex{}
 )
 
 type LogCallback interface {
@@ -85,8 +91,8 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	nolog := app.Flag("nolog", "turn off logging").Default("false").Bool()
 	kcpArgs.Key = app.Flag("kcp-key", "pre-shared secret between client and server").Default("secrect").String()
 	kcpArgs.Crypt = app.Flag("kcp-method", "encrypt/decrypt method, can be: aes, aes-128, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, sm4, none").Default("aes").Enum("aes", "aes-128", "aes-192", "salsa20", "blowfish", "twofish", "cast5", "3des", "tea", "xtea", "xor", "sm4", "none")
-	kcpArgs.Mode = app.Flag("kcp-mode", "profiles: fast3, fast2, fast, normal, manual").Default("fast").Enum("fast3", "fast2", "fast", "normal", "manual")
-	kcpArgs.MTU = app.Flag("kcp-mtu", "set maximum transmission unit for UDP packets").Default("450").Int()
+	kcpArgs.Mode = app.Flag("kcp-mode", "profiles: fast3, fast2, fast, normal, manual").Default("fast3").Enum("fast3", "fast2", "fast", "normal", "manual")
+	kcpArgs.MTU = app.Flag("kcp-mtu", "set maximum transmission unit for UDP packets").Default("1350").Int()
 	kcpArgs.SndWnd = app.Flag("kcp-sndwnd", "set send window size(num of packets)").Default("1024").Int()
 	kcpArgs.RcvWnd = app.Flag("kcp-rcvwnd", "set receive window size(num of packets)").Default("1024").Int()
 	kcpArgs.DataShard = app.Flag("kcp-ds", "set reed-solomon erasure coding - datashard").Default("10").Int()
@@ -134,13 +140,15 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	httpArgs.ParentKey = http.Flag("parent-key", "the password for auto encrypt/decrypt parent connection data").Short('Z').Default("").String()
 	httpArgs.LocalCompress = http.Flag("local-compress", "auto compress/decompress data on local connection").Short('m').Default("false").Bool()
 	httpArgs.ParentCompress = http.Flag("parent-compress", "auto compress/decompress data on parent connection").Short('M').Default("false").Bool()
-	httpArgs.LoadBalanceMethod = http.Flag("lb-method", "load balance method when use multiple parent,can be <roundrobin|leastconn|leasttime|hash|weight>").Default("hash").Enum("roundrobin", "weight", "leastconn", "leasttime", "hash")
+	httpArgs.Intelligent = http.Flag("intelligent", "settting intelligent HTTP, SOCKS5 proxy mode, can be <intelligent|direct|parent>").Default("intelligent").Enum("intelligent", "direct", "parent")
+	httpArgs.LoadBalanceMethod = http.Flag("lb-method", "load balance method when use multiple parent,can be <roundrobin|leastconn|leasttime|hash|weight>").Default("roundrobin").Enum("roundrobin", "weight", "leastconn", "leasttime", "hash")
 	httpArgs.LoadBalanceTimeout = http.Flag("lb-timeout", "tcp milliseconds timeout of connecting to parent").Default("500").Int()
 	httpArgs.LoadBalanceRetryTime = http.Flag("lb-retrytime", "sleep time milliseconds after checking").Default("1000").Int()
 	httpArgs.LoadBalanceHashTarget = http.Flag("lb-hashtarget", "use target address to choose parent for LB").Default("false").Bool()
 	httpArgs.LoadBalanceOnlyHA = http.Flag("lb-onlyha", "use only `high availability mode` to choose parent for LB").Default("false").Bool()
 	httpArgs.RateLimit = http.Flag("rate-limit", "rate limit (bytes/second) of each connection, such as: 100K 1.5M . 0 means no limitation").Short('l').Default("0").String()
 	httpArgs.BindListen = http.Flag("bind-listen", "using listener binding IP when connect to target").Short('B').Default("false").Bool()
+	httpArgs.Jumper = http.Flag("jumper", "https or socks5 proxies used when connecting to parent, only worked of -T is tls or tcp, format is https://username:password@host:port https://host:port or socks5://username:password@host:port socks5://host:port").Short('J').Default("").String()
 	httpArgs.Debug = debug
 	//########tcp#########
 	tcp := app.Command("tcp", "proxy on tcp mode")
@@ -269,7 +277,8 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	socksArgs.ParentKey = socks.Flag("parent-key", "the password for auto encrypt/decrypt parent connection data").Short('Z').Default("").String()
 	socksArgs.LocalCompress = socks.Flag("local-compress", "auto compress/decompress data on local connection").Short('m').Default("false").Bool()
 	socksArgs.ParentCompress = socks.Flag("parent-compress", "auto compress/decompress data on parent connection").Short('M').Default("false").Bool()
-	socksArgs.LoadBalanceMethod = socks.Flag("lb-method", "load balance method when use multiple parent,can be <roundrobin|leastconn|leasttime|hash|weight>").Default("hash").Enum("roundrobin", "weight", "leastconn", "leasttime", "hash")
+	socksArgs.Intelligent = socks.Flag("intelligent", "settting intelligent HTTP, SOCKS5 proxy mode, can be <intelligent|direct|parent>").Default("intelligent").Enum("intelligent", "direct", "parent")
+	socksArgs.LoadBalanceMethod = socks.Flag("lb-method", "load balance method when use multiple parent,can be <roundrobin|leastconn|leasttime|hash|weight>").Default("roundrobin").Enum("roundrobin", "weight", "leastconn", "leasttime", "hash")
 	socksArgs.LoadBalanceTimeout = socks.Flag("lb-timeout", "tcp milliseconds timeout of connecting to parent").Default("500").Int()
 	socksArgs.LoadBalanceRetryTime = socks.Flag("lb-retrytime", "sleep time milliseconds after checking").Default("1000").Int()
 	socksArgs.LoadBalanceHashTarget = socks.Flag("lb-hashtarget", "use target address to choose parent for LB").Default("false").Bool()
@@ -316,6 +325,8 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	spsArgs.LoadBalanceHashTarget = sps.Flag("lb-hashtarget", "use target address to choose parent for LB").Default("false").Bool()
 	spsArgs.LoadBalanceOnlyHA = sps.Flag("lb-onlyha", "use only `high availability mode` to choose parent for LB").Default("false").Bool()
 	spsArgs.RateLimit = sps.Flag("rate-limit", "rate limit (bytes/second) of each connection, such as: 100K 1.5M . 0 means no limitation").Short('l').Default("0").String()
+	spsArgs.Jumper = sps.Flag("jumper", "https or socks5 proxies used when connecting to parent, only worked of -T is tls or tcp, format is https://username:password@host:port https://host:port or socks5://username:password@host:port socks5://host:port").Default("").String()
+	spsArgs.ParentTLSSingle = sps.Flag("parent-tls-single", "conntect to parent insecure skip verify").Default("false").Bool()
 	spsArgs.Debug = debug
 
 	//########dns#########
@@ -407,7 +418,7 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	muxClientArgs.KCP = kcpArgs
 	dnsArgs.KCP = kcpArgs
 
-	log := logger.New(os.Stderr, "", logger.Ldate|logger.Ltime)
+	log := logger.New(os.Stdout, "", logger.Ldate|logger.Ltime)
 	flags := logger.Ldate
 	if *debug {
 		flags |= logger.Lshortfile | logger.Lmicroseconds
@@ -472,4 +483,42 @@ func Stop(serviceID string) {
 
 func Version() string {
 	return SDK_VERSION
+}
+func StartProfiling(storePath string) {
+	profilingLock.Lock()
+	defer profilingLock.Unlock()
+	if !isProfiling {
+		isProfiling = true
+		if storePath == "" {
+			storePath = "."
+		}
+		cpuProfilingFile, _ = os.Create(filepath.Join(storePath, "cpu.prof"))
+		memProfilingFile, _ = os.Create(filepath.Join(storePath, "memory.prof"))
+		blockProfilingFile, _ = os.Create(filepath.Join(storePath, "block.prof"))
+		goroutineProfilingFile, _ = os.Create(filepath.Join(storePath, "goroutine.prof"))
+		threadcreateProfilingFile, _ = os.Create(filepath.Join(storePath, "threadcreate.prof"))
+		pprof.StartCPUProfile(cpuProfilingFile)
+	}
+}
+func StopProfiling() {
+	profilingLock.Lock()
+	defer profilingLock.Unlock()
+	if isProfiling {
+		isProfiling = false
+		pprof.StopCPUProfile()
+		goroutine := pprof.Lookup("goroutine")
+		goroutine.WriteTo(goroutineProfilingFile, 1)
+		heap := pprof.Lookup("heap")
+		heap.WriteTo(memProfilingFile, 1)
+		block := pprof.Lookup("block")
+		block.WriteTo(blockProfilingFile, 1)
+		threadcreate := pprof.Lookup("threadcreate")
+		threadcreate.WriteTo(threadcreateProfilingFile, 1)
+		//close
+		goroutineProfilingFile.Close()
+		memProfilingFile.Close()
+		blockProfilingFile.Close()
+		threadcreateProfilingFile.Close()
+	}
+
 }

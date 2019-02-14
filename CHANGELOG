@@ -1,5 +1,48 @@
 proxy更新日志
 
+v6.9
+1.修复了sps的start潜在的crash问题.
+2.sps代理增加了--parent-tls-single参数用来支持单向tls上级。
+3.sps代理增加了对单个上级认证信息的支持,如果没有单独设置,就使用全局-A设置.
+  现在上级格式: -P YTpi#2.2.2.2:33080@1
+  说明:
+  YTpi 是经过base64编码的认证信息,比如是http(s)/socks原始认证信息a:b,用户是a密码是b,base64编码之后是:YTpi
+     如果是ss,那么a就是加密方法,b是密码,比如:aes-192-cfb:your_pass,base64编码之后是:YWVzLTE5Mi1jZmI6eW91cl9wYXNz
+  # 是间隔符号,如果有认证信息,必须有#,没有认证信息可以省略#.
+  2.2.2.2:33080 是上级地址
+  @1 是设置权重,可以参考手册权重部分.
+4.修复了socks5代理错误处理超时的问题.
+5.修复了http(s)代理错误处理-Z的问题.
+
+v6.8
+1.HTTP(S)\SOCKS5代理,API认证功能,发送给认证接口的参数增加了本地IP,local_ip字段,
+ 代表用户访问的是本地服务器的哪个IP.
+2.fix #194 , fix #134 , 代理更稳定.
+3.增加了一波英文文档.
+
+v6.6
+1.优化了limitconn的关闭逻辑,释放更多资源.
+2.http(s)\socks代理增加了--intelligent,智能模式设置,可以是intelligent|direct|parent三者之一,
+默认是:intelligent.每个值的含义如下.
+--intelligent=direct,不在blocked里面的目标都直连. 
+--intelligent=parent,不在direct里面的目标都走上级. 
+--intelligent=intelligent,blocked和direct里面都没有的目标,智能判断是否使用上级访问目标. 
+
+v6.5
+1.修复了合并企业版遗留的一些bug. 
+
+v6.4
+1.http(s)代理增加了--jumper参数,可以穿透外部代理连接上级.
+2.优化了socks5代理UDP功能可能存在的内存占用过多问题.
+3.优化了jumper,避免某些情况下不能正确返回错误的问题.
+4.sps代理增加了--jumper参数,可以穿透外部代理连接上级.
+5.修复了--debug不能正常工作的问题.
+
+v6.3
+1.fixed #156
+2.修复DNS代理,没有定时保存缓存结果到文件.重启会降低查询速度.
+
+
 v6.2
 1.修复encrypt.Conn释放内存,导致的潜在panic问题.
 2.修复了basic认证,处理认证文件没有正确处理注释的bug.

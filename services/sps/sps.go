@@ -13,6 +13,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/snail007/goproxy/core/cs/server"
@@ -20,9 +21,11 @@ import (
 	"github.com/snail007/goproxy/services"
 	"github.com/snail007/goproxy/utils"
 	"github.com/snail007/goproxy/utils/conncrypt"
+	cryptool "github.com/snail007/goproxy/utils/crypt"
 	"github.com/snail007/goproxy/utils/datasize"
 	"github.com/snail007/goproxy/utils/dnsx"
 	"github.com/snail007/goproxy/utils/iolimiter"
+	"github.com/snail007/goproxy/utils/jumper"
 	"github.com/snail007/goproxy/utils/lb"
 	"github.com/snail007/goproxy/utils/mapx"
 	"github.com/snail007/goproxy/utils/sni"
@@ -70,10 +73,12 @@ type SPSArgs struct {
 	LoadBalanceRetryTime  *int
 	LoadBalanceHashTarget *bool
 	LoadBalanceOnlyHA     *bool
+	ParentTLSSingle       *bool
 
 	RateLimit      *string
 	RateLimitBytes float64
 	Debug          *bool
+	Jumper         *string
 }
 type SPS struct {
 	cfg                   SPSArgs
@@ -88,6 +93,9 @@ type SPS struct {
 	lb                    *lb.Group
 	udpLocalKey           []byte
 	udpParentKey          []byte
+	jumper                *jumper.Jumper
+	parentAuthData        *sync.Map
+	parentCipherData      *sync.Map
 }
 
 func NewSPS() services.Service {
@@ -97,6 +105,8 @@ func NewSPS() services.Service {
 		serverChannels:        []*server.ServerChannel{},
 		userConns:             mapx.NewConcurrentMap(),
 		udpRelatedPacketConns: mapx.NewConcurrentMap(),
+		parentAuthData:        &sync.Map{},
+		parentCipherData:      &sync.Map{},
 	}
 }
 func (s *SPS) CheckArgs() (err error) {
@@ -118,9 +128,11 @@ func (s *SPS) CheckArgs() (err error) {
 		return
 	}
 	if *s.cfg.ParentType == "tls" || *s.cfg.LocalType == "tls" {
-		s.cfg.CertBytes, s.cfg.KeyBytes, err = utils.TlsBytes(*s.cfg.CertFile, *s.cfg.KeyFile)
-		if err != nil {
-			return
+		if !*s.cfg.ParentTLSSingle {
+			s.cfg.CertBytes, s.cfg.KeyBytes, err = utils.TlsBytes(*s.cfg.CertFile, *s.cfg.KeyFile)
+			if err != nil {
+				return
+			}
 		}
 		if *s.cfg.CaCertFile != "" {
 			s.cfg.CaCertBytes, err = ioutil.ReadFile(*s.cfg.CaCertFile)
@@ -141,6 +153,19 @@ func (s *SPS) CheckArgs() (err error) {
 	}
 	s.udpLocalKey = s.LocalUDPKey()
 	s.udpParentKey = s.ParentUDPKey()
+	if *s.cfg.Jumper != "" {
+		if *s.cfg.ParentType != "tls" && *s.cfg.ParentType != "tcp" {
+			err = fmt.Errorf("jumper only worked of -T is tls or tcp")
+			return
+		}
+		var j jumper.Jumper
+		j, err = jumper.New(*s.cfg.Jumper, time.Millisecond*time.Duration(*s.cfg.Timeout))
+		if err != nil {
+			err = fmt.Errorf("parse jumper fail, err %s", err)
+			return
+		}
+		s.jumper = &j
+	}
 	return
 }
 func (s *SPS) InitService() (err error) {
@@ -150,7 +175,10 @@ func (s *SPS) InitService() (err error) {
 	}
 
 	if len(*s.cfg.Parent) > 0 {
-		s.InitLB()
+		err = s.InitLB()
+		if err != nil {
+			return
+		}
 	}
 
 	err = s.InitBasicAuth()
@@ -177,13 +205,14 @@ func (s *SPS) StopService() {
 		if e != nil {
 			s.log.Printf("stop sps service crashed,%s", e)
 		} else {
-			s.log.Printf("service sps stoped")
+			s.log.Printf("service sps stopped")
 		}
 		s.basicAuth = utils.BasicAuth{}
 		s.cfg = SPSArgs{}
 		s.domainResolver = dnsx.DomainResolver{}
 		s.lb = nil
 		s.localCipher = nil
+		s.jumper = nil
 		s.log = nil
 		s.parentCipher = nil
 		s.serverChannels = nil
@@ -191,6 +220,8 @@ func (s *SPS) StopService() {
 		s.udpParentKey = nil
 		s.udpRelatedPacketConns = nil
 		s.userConns = nil
+		s.parentAuthData = nil
+		s.parentCipherData = nil
 		s = nil
 	}()
 	for _, sc := range s.serverChannels {
@@ -237,8 +268,11 @@ func (s *SPS) Start(args interface{}, log *logger.Logger) (err error) {
 				err = sc.ListenTCP(s.callback)
 			} else if *s.cfg.LocalType == "tls" {
 				err = sc.ListenTLS(s.cfg.CertBytes, s.cfg.KeyBytes, s.cfg.CaCertBytes, s.callback)
-			} else if *s.cfg.LocalType == "tcp" {
+			} else if *s.cfg.LocalType == "kcp" {
 				err = sc.ListenKCP(s.cfg.KCP, s.callback, s.log)
+			}
+			if err != nil {
+				return
 			}
 			if *s.cfg.ParentServiceType == "socks" {
 				err = s.RunSSUDP(addr)
@@ -414,8 +448,8 @@ func (s *SPS) OutToTCP(inConn *net.Conn) (lbAddr string, err error) {
 		utils.CloseConn(inConn)
 		return
 	}
-
-	if *s.cfg.ParentAuth != "" || *s.cfg.ParentSSKey != "" || s.IsBasicAuth() {
+	ParentAuth := s.getParentAuth(lbAddr)
+	if ParentAuth != "" || *s.cfg.ParentSSKey != "" || s.IsBasicAuth() {
 		forwardBytes = utils.RemoveProxyHeaders(forwardBytes)
 	}
 
@@ -435,8 +469,8 @@ func (s *SPS) OutToTCP(inConn *net.Conn) (lbAddr string, err error) {
 		pb.WriteString("Connection: Keep-Alive\r\n")
 
 		u := ""
-		if *s.cfg.ParentAuth != "" {
-			a := strings.Split(*s.cfg.ParentAuth, ":")
+		if ParentAuth != "" {
+			a := strings.Split(ParentAuth, ":")
 			if len(a) != 2 {
 				err = fmt.Errorf("parent auth data format error")
 				return
@@ -487,7 +521,7 @@ func (s *SPS) OutToTCP(inConn *net.Conn) (lbAddr string, err error) {
 		s.log.Printf("connect %s", address)
 
 		//socks client
-		_, err = s.HandshakeSocksParent(&outConn, "tcp", address, auth, false)
+		_, err = s.HandshakeSocksParent(ParentAuth, &outConn, "tcp", address, auth, false)
 		if err != nil {
 			s.log.Printf("handshake fail, %s", err)
 			return
@@ -500,7 +534,7 @@ func (s *SPS) OutToTCP(inConn *net.Conn) (lbAddr string, err error) {
 			return
 		}
 
-		outConn, err = ss.DialWithRawAddr(&outConn, ra, "", s.parentCipher.Copy())
+		outConn, err = ss.DialWithRawAddr(&outConn, ra, "", s.getParentCipher(lbAddr))
 		if err != nil {
 			err = fmt.Errorf("dial ss parent fail, err : %s", err)
 			return
@@ -560,10 +594,41 @@ func (s *SPS) InitBasicAuth() (err error) {
 	}
 	return
 }
-func (s *SPS) InitLB() {
+func (s *SPS) InitLB() (err error) {
 	configs := lb.BackendsConfig{}
 	for _, addr := range *s.cfg.Parent {
-		_addrInfo := strings.Split(addr, "@")
+		var _addrInfo []string
+		if strings.Contains(addr, "#") {
+			_s := addr[:strings.Index(addr, "#")]
+			_auth, err := cryptool.CryptTools.Base64Decode(_s)
+			if err != nil {
+				s.log.Printf("decoding parent auth data [ %s ] fail , error : %s", _s, err)
+				return err
+			}
+			_addrInfo = strings.Split(addr[strings.Index(addr, "#")+1:], "@")
+			if *s.cfg.ParentServiceType == "ss" {
+				_s := strings.Split(_auth, ":")
+				m := _s[0]
+				k := _s[1]
+				if m == "" {
+					m = *s.cfg.ParentSSMethod
+				}
+				if k == "" {
+					k = *s.cfg.ParentSSKey
+				}
+				cipher, err := ss.NewCipher(m, k)
+				if err != nil {
+					s.log.Printf("error generating cipher, ssMethod: %s, ssKey: %s, error : %s", m, k, err)
+					return err
+				}
+				s.parentCipherData.Store(_addrInfo[0], cipher)
+			} else {
+				s.parentAuthData.Store(_addrInfo[0], _auth)
+			}
+
+		} else {
+			_addrInfo = strings.Split(addr, "@")
+		}
 		_addr := _addrInfo[0]
 		weight := 1
 		if len(_addrInfo) == 2 {
@@ -580,6 +645,19 @@ func (s *SPS) InitLB() {
 	}
 	LB := lb.NewGroup(utils.LBMethod(*s.cfg.LoadBalanceMethod), configs, &s.domainResolver, s.log, *s.cfg.Debug)
 	s.lb = &LB
+	return
+}
+func (s *SPS) getParentAuth(lbAddr string) string {
+	if v, ok := s.parentAuthData.Load(lbAddr); ok {
+		return v.(string)
+	}
+	return *s.cfg.ParentAuth
+}
+func (s *SPS) getParentCipher(lbAddr string) *ss.Cipher {
+	if v, ok := s.parentCipherData.Load(lbAddr); ok {
+		return v.(*ss.Cipher).Copy()
+	}
+	return s.parentCipher.Copy()
 }
 func (s *SPS) IsBasicAuth() bool {
 	return *s.cfg.AuthFile != "" || len(*s.cfg.Auth) > 0 || *s.cfg.AuthURL != ""
@@ -635,15 +713,41 @@ func (s *SPS) Resolve(address string) string {
 }
 func (s *SPS) GetParentConn(address string) (conn net.Conn, err error) {
 	if *s.cfg.ParentType == "tls" {
-		var _conn tls.Conn
-		_conn, err = utils.TlsConnectHost(address, *s.cfg.Timeout, s.cfg.CertBytes, s.cfg.KeyBytes, s.cfg.CaCertBytes)
-		if err == nil {
-			conn = net.Conn(&_conn)
+		if s.jumper == nil {
+			var _conn tls.Conn
+			if *s.cfg.ParentTLSSingle {
+				_conn, err = utils.SingleTlsConnectHost(address, *s.cfg.Timeout, s.cfg.CaCertBytes)
+			} else {
+				_conn, err = utils.TlsConnectHost(address, *s.cfg.Timeout, s.cfg.CertBytes, s.cfg.KeyBytes, s.cfg.CaCertBytes)
+			}
+			if err == nil {
+				conn = net.Conn(&_conn)
+			}
+		} else {
+			var conf *tls.Config
+			if *s.cfg.ParentTLSSingle {
+				conf, err = utils.SingleTlsConfig(s.cfg.CaCertBytes)
+			} else {
+				conf, err = utils.TlsConfig(s.cfg.CertBytes, s.cfg.KeyBytes, s.cfg.CaCertBytes)
+			}
+			if err != nil {
+				return nil, err
+			}
+			var _c net.Conn
+			_c, err = s.jumper.Dial(address, time.Millisecond*time.Duration(*s.cfg.Timeout))
+			if err == nil {
+				conn = net.Conn(tls.Client(_c, conf))
+			}
 		}
+
 	} else if *s.cfg.ParentType == "kcp" {
 		conn, err = utils.ConnectKCPHost(address, s.cfg.KCP)
 	} else {
-		conn, err = utils.ConnectHost(address, *s.cfg.Timeout)
+		if s.jumper == nil {
+			conn, err = utils.ConnectHost(address, *s.cfg.Timeout)
+		} else {
+			conn, err = s.jumper.Dial(address, time.Millisecond*time.Duration(*s.cfg.Timeout))
+		}
 	}
 	if err == nil {
 		if *s.cfg.ParentCompress {
@@ -657,9 +761,9 @@ func (s *SPS) GetParentConn(address string) (conn net.Conn, err error) {
 	}
 	return
 }
-func (s *SPS) HandshakeSocksParent(outconn *net.Conn, network, dstAddr string, auth socks.Auth, fromSS bool) (client *socks.ClientConn, err error) {
-	if *s.cfg.ParentAuth != "" {
-		a := strings.Split(*s.cfg.ParentAuth, ":")
+func (s *SPS) HandshakeSocksParent(parentAuth string, outconn *net.Conn, network, dstAddr string, auth socks.Auth, fromSS bool) (client *socks.ClientConn, err error) {
+	if parentAuth != "" {
+		a := strings.Split(parentAuth, ":")
 		if len(a) != 2 {
 			err = fmt.Errorf("parent auth data format error")
 			return
@@ -683,7 +787,9 @@ func (s *SPS) ParentUDPKey() (key []byte) {
 			return []byte(v)[:24]
 		}
 	case "tls":
-		return s.cfg.KeyBytes[:24]
+		if s.cfg.KeyBytes != nil {
+			return s.cfg.KeyBytes[:24]
+		}
 	case "kcp":
 		v := fmt.Sprintf("%x", md5.Sum([]byte(*s.cfg.KCP.Key)))
 		return []byte(v)[:24]
